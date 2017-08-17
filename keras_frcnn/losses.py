@@ -3,6 +3,8 @@ from keras.objectives import categorical_crossentropy
 
 if K.image_dim_ordering() == 'tf':
 	import tensorflow as tf
+	# HACK(aleks, 08/17/17): monkey patch Keras 2.0.3 -> 1.2.1
+	K.less_equal = tf.less_equal
 
 lambda_rpn_regr = 1.0
 lambda_rpn_class = 1.0

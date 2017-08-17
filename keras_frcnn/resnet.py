@@ -8,241 +8,377 @@ Adapted from code contributed by BigMoyan.
 from __future__ import print_function
 from __future__ import absolute_import
 
-from keras.layers import Input, Add, Dense, Activation, Flatten, Convolution2D, MaxPooling2D, ZeroPadding2D, \
-    AveragePooling2D, TimeDistributed
+import numpy as np
+
+from keras.engine.topology import Layer
+from keras.layers import (
+    Input,
+    Dense,
+    Activation,
+    Flatten,
+    Convolution2D,
+    MaxPooling2D,
+    ZeroPadding2D,
+    AveragePooling2D,
+    TimeDistributed)
 
 from keras import backend as K
 
 from keras_frcnn.RoiPoolingConv import RoiPoolingConv
 from keras_frcnn.FixedBatchNormalization import FixedBatchNormalization
 
+import tensorflow as tf
+
+
+class TimeDistributedBatchSizeFixed(TimeDistributed):
+  """
+  In Keras 2.0.3, the TimeDistributed layer wrapper preserves batch size. For our
+  backport to Keras 1.2.1, we'd like to preserve this behavior.
+  """
+  def call(self, inputs, mask=None):
+    outputs = super(TimeDistributedBatchSizeFixed, self).call(inputs, mask=mask)
+    input_shape = inputs.get_shape().as_list()
+    if input_shape[0] == 1:  # assume that input_shape[1] is batch_size
+      output_shape_mod = outputs.get_shape().as_list()
+      output_shape_mod[1] = input_shape[1]
+      outputs.set_shape(output_shape_mod)
+    return outputs
+
+
+class AddLayer(Layer):
+  """
+  Backport Keras 2.0.3 -> 1.2.1
+  """
+  def build(self, input_shapes):
+    base_shape = input_shapes[0]
+    for s in input_shapes:
+      assert s == base_shape, 'not all inputs to AddLayer have the same shape'
+    super(AddLayer, self).build(input_shapes)
+
+  def call(self, inputs, mask=None):
+    """Source: https://github.com/fchollet/keras/blob/2.0.3/keras/layers/merge.py#L208"""
+    return tf.add_n(inputs)
+
+  def get_output_shape_for(self, input_shapes):
+    return input_shapes[0]
+
+
 def get_weight_path():
-    if K.image_dim_ordering() == 'th':
-        return 'resnet50_weights_th_dim_ordering_th_kernels_notop.h5'
-    else:
-        return 'resnet50_weights_tf_dim_ordering_tf_kernels.h5'
+  if K.image_dim_ordering() == 'th':
+    return 'resnet50_weights_th_dim_ordering_th_kernels_notop.h5'
+  else:
+    return 'resnet50_weights_tf_dim_ordering_tf_kernels.h5'
+
 
 def get_img_output_length(width, height):
-    def get_output_length(input_length):
-        # zero_pad
-        input_length += 6
-        # apply 4 strided convolutions
-        filter_sizes = [7, 3, 1, 1]
-        stride = 2
-        for filter_size in filter_sizes:
-            input_length = (input_length - filter_size + stride) // stride
-        return input_length
 
-    return get_output_length(width), get_output_length(height) 
+  def get_output_length(input_length):
+    # zero_pad
+    input_length += 6
+    # apply 4 strided convolutions
+    filter_sizes = [7, 3, 1, 1]
+    stride = 2
+    for filter_size in filter_sizes:
+      input_length = (input_length - filter_size + stride) // stride
+    return input_length
+
+  return get_output_length(width), get_output_length(height)
+
 
 def identity_block(input_tensor, kernel_size, filters, stage, block, trainable=True):
 
-    nb_filter1, nb_filter2, nb_filter3 = filters
-    
-    if K.image_dim_ordering() == 'tf':
-        bn_axis = 3
-    else:
-        bn_axis = 1
+  nb_filter1, nb_filter2, nb_filter3 = filters
 
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
+  if K.image_dim_ordering() == 'tf':
+    bn_axis = 3
+  else:
+    bn_axis = 1
 
-    x = Convolution2D(nb_filter1, (1, 1), name=conv_name_base + '2a', trainable=trainable)(input_tensor)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
-    x = Activation('relu')(x)
+  conv_name_base = 'res' + str(stage) + block + '_branch'
+  bn_name_base = 'bn' + str(stage) + block + '_branch'
 
-    x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b', trainable=trainable)(x)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
-    x = Activation('relu')(x)
+  x = Convolution2D(
+      nb_filter1, 1, 1, name=conv_name_base + '2a', trainable=trainable)(input_tensor)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+  x = Activation('relu')(x)
 
-    x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+  x = Convolution2D(
+      nb_filter2, kernel_size, kernel_size,
+      border_mode='same',
+      name=conv_name_base + '2b',
+      trainable=trainable)(x)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+  x = Activation('relu')(x)
 
-    x = Add()([x, input_tensor])
-    x = Activation('relu')(x)
-    return x
+  x = Convolution2D(nb_filter3, 1, 1, name=conv_name_base + '2c', trainable=trainable)(x)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
+
+  x = AddLayer()([x, input_tensor])
+  x = Activation('relu')(x)
+  return x
 
 
 def identity_block_td(input_tensor, kernel_size, filters, stage, block, trainable=True):
 
-    # identity block time distributed
+  # identity block time distributed
 
-    nb_filter1, nb_filter2, nb_filter3 = filters
-    if K.image_dim_ordering() == 'tf':
-        bn_axis = 3
-    else:
-        bn_axis = 1
+  nb_filter1, nb_filter2, nb_filter3 = filters
+  if K.image_dim_ordering() == 'tf':
+    bn_axis = 3
+  else:
+    bn_axis = 1
 
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
+  conv_name_base = 'res' + str(stage) + block + '_branch'
+  bn_name_base = 'bn' + str(stage) + block + '_branch'
 
-    x = TimeDistributed(Convolution2D(nb_filter1, (1, 1), trainable=trainable, kernel_initializer='normal'), name=conv_name_base + '2a')(input_tensor)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
-    x = Activation('relu')(x)
+  x = TimeDistributedBatchSizeFixed(
+      Convolution2D(nb_filter1, 1, 1, trainable=trainable, init='normal'),
+      name=conv_name_base + '2a')(input_tensor)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+  x = Activation('relu')(x)
 
-    x = TimeDistributed(Convolution2D(nb_filter2, (kernel_size, kernel_size), trainable=trainable, kernel_initializer='normal',padding='same'), name=conv_name_base + '2b')(x)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
-    x = Activation('relu')(x)
+  x = TimeDistributedBatchSizeFixed(
+      Convolution2D(
+          nb_filter2, kernel_size, kernel_size,
+          trainable=trainable,
+          init='normal',
+          border_mode='same'),
+      name=conv_name_base + '2b')(x)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+  x = Activation('relu')(x)
 
-    x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), trainable=trainable, kernel_initializer='normal'), name=conv_name_base + '2c')(x)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+  x = TimeDistributedBatchSizeFixed(
+      Convolution2D(nb_filter3, 1, 1, trainable=trainable, init='normal'),
+      name=conv_name_base + '2c')(x)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
 
-    x = Add()([x, input_tensor])
-    x = Activation('relu')(x)
+  x = AddLayer()([x, input_tensor])
+  x = Activation('relu')(x)
 
-    return x
-
-def conv_block(input_tensor, kernel_size, filters, stage, block, strides=(2, 2), trainable=True):
-
-    nb_filter1, nb_filter2, nb_filter3 = filters
-    if K.image_dim_ordering() == 'tf':
-        bn_axis = 3
-    else:
-        bn_axis = 1
-
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
-
-    x = Convolution2D(nb_filter1, (1, 1), strides=strides, name=conv_name_base + '2a', trainable=trainable)(input_tensor)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
-    x = Activation('relu')(x)
-
-    x = Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', name=conv_name_base + '2b', trainable=trainable)(x)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
-    x = Activation('relu')(x)
-
-    x = Convolution2D(nb_filter3, (1, 1), name=conv_name_base + '2c', trainable=trainable)(x)
-    x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
-
-    shortcut = Convolution2D(nb_filter3, (1, 1), strides=strides, name=conv_name_base + '1', trainable=trainable)(input_tensor)
-    shortcut = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '1')(shortcut)
-
-    x = Add()([x, shortcut])
-    x = Activation('relu')(x)
-    return x
+  return x
 
 
-def conv_block_td(input_tensor, kernel_size, filters, stage, block, input_shape, strides=(2, 2), trainable=True):
+def conv_block(input_tensor, kernel_size, filters, stage, block, subsample=(2, 2), trainable=True):
 
-    # conv block time distributed
+  nb_filter1, nb_filter2, nb_filter3 = filters
+  if K.image_dim_ordering() == 'tf':
+    bn_axis = 3
+  else:
+    bn_axis = 1
 
-    nb_filter1, nb_filter2, nb_filter3 = filters
-    if K.image_dim_ordering() == 'tf':
-        bn_axis = 3
-    else:
-        bn_axis = 1
+  conv_name_base = 'res' + str(stage) + block + '_branch'
+  bn_name_base = 'bn' + str(stage) + block + '_branch'
 
-    conv_name_base = 'res' + str(stage) + block + '_branch'
-    bn_name_base = 'bn' + str(stage) + block + '_branch'
+  x = Convolution2D(
+      nb_filter1, 1, 1, subsample=subsample, name=conv_name_base + '2a',
+      trainable=trainable)(input_tensor)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2a')(x)
+  x = Activation('relu')(x)
 
-    x = TimeDistributed(Convolution2D(nb_filter1, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'), input_shape=input_shape, name=conv_name_base + '2a')(input_tensor)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
-    x = Activation('relu')(x)
+  x = Convolution2D(
+      nb_filter2, kernel_size, kernel_size,
+      border_mode='same',
+      name=conv_name_base + '2b',
+      trainable=trainable)(x)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2b')(x)
+  x = Activation('relu')(x)
 
-    x = TimeDistributed(Convolution2D(nb_filter2, (kernel_size, kernel_size), padding='same', trainable=trainable, kernel_initializer='normal'), name=conv_name_base + '2b')(x)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
-    x = Activation('relu')(x)
+  x = Convolution2D(nb_filter3, 1, 1, name=conv_name_base + '2c', trainable=trainable)(x)
+  x = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '2c')(x)
 
-    x = TimeDistributed(Convolution2D(nb_filter3, (1, 1), kernel_initializer='normal'), name=conv_name_base + '2c', trainable=trainable)(x)
-    x = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+  shortcut = Convolution2D(
+      nb_filter3, 1, 1, subsample=subsample, name=conv_name_base + '1',
+      trainable=trainable)(input_tensor)
+  shortcut = FixedBatchNormalization(axis=bn_axis, name=bn_name_base + '1')(shortcut)
 
-    shortcut = TimeDistributed(Convolution2D(nb_filter3, (1, 1), strides=strides, trainable=trainable, kernel_initializer='normal'), name=conv_name_base + '1')(input_tensor)
-    shortcut = TimeDistributed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '1')(shortcut)
+  x = AddLayer()([x, shortcut])
+  x = Activation('relu')(x)
+  return x
 
-    x = Add()([x, shortcut])
-    x = Activation('relu')(x)
-    return x
+
+def conv_block_td(input_tensor,
+                  kernel_size,
+                  filters,
+                  stage,
+                  block,
+                  input_shape,
+                  subsample=(2, 2),
+                  trainable=True):
+
+  # conv block time distributed
+  batch_size = input_shape[0]
+
+  nb_filter1, nb_filter2, nb_filter3 = filters
+  if K.image_dim_ordering() == 'tf':
+    bn_axis = 3
+  else:
+    bn_axis = 1
+
+  conv_name_base = 'res' + str(stage) + block + '_branch'
+  bn_name_base = 'bn' + str(stage) + block + '_branch'
+
+  td_wrapper = TimeDistributedBatchSizeFixed(
+      Convolution2D(
+          nb_filter1, 1, 1, subsample=subsample, trainable=trainable, init='normal'),
+      input_shape=input_shape,
+      name=conv_name_base + '2a')
+  x = td_wrapper(input_tensor)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2a')(x)
+
+  x = Activation('relu')(x)
+
+  x = TimeDistributedBatchSizeFixed(
+      Convolution2D(
+          nb_filter2, kernel_size, kernel_size,
+          border_mode='same',
+          trainable=trainable,
+          init='normal'),
+      name=conv_name_base + '2b')(x)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2b')(x)
+  x = Activation('relu')(x)
+
+  x = TimeDistributedBatchSizeFixed(
+      Convolution2D(nb_filter3, 1, 1, init='normal'),
+      name=conv_name_base + '2c',
+      trainable=trainable)(x)
+  x = TimeDistributedBatchSizeFixed(FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '2c')(x)
+
+  shortcut = TimeDistributedBatchSizeFixed(
+      Convolution2D(
+          nb_filter3, 1, 1, subsample=subsample, trainable=trainable, init='normal'),
+      name=conv_name_base + '1')(input_tensor)
+  shortcut = TimeDistributedBatchSizeFixed(
+      FixedBatchNormalization(axis=bn_axis), name=bn_name_base + '1')(shortcut)
+
+  x = AddLayer()([x, shortcut])
+  x = Activation('relu')(x)
+  return x
+
 
 def nn_base(input_tensor=None, trainable=False):
 
-    # Determine proper input shape
-    if K.image_dim_ordering() == 'th':
-        input_shape = (3, None, None)
+  # Determine proper input shape
+  if K.image_dim_ordering() == 'th':
+    input_shape = (3, None, None)
+  else:
+    input_shape = (None, None, 3)
+
+  if input_tensor is None:
+    img_input = Input(shape=input_shape)
+  else:
+    if not K.is_keras_tensor(input_tensor):
+      img_input = Input(tensor=input_tensor, shape=input_shape)
     else:
-        input_shape = (None, None, 3)
+      img_input = input_tensor
 
-    if input_tensor is None:
-        img_input = Input(shape=input_shape)
-    else:
-        if not K.is_keras_tensor(input_tensor):
-            img_input = Input(tensor=input_tensor, shape=input_shape)
-        else:
-            img_input = input_tensor
+  if K.image_dim_ordering() == 'tf':
+    bn_axis = 3
+  else:
+    bn_axis = 1
 
-    if K.image_dim_ordering() == 'tf':
-        bn_axis = 3
-    else:
-        bn_axis = 1
+  x = ZeroPadding2D((3, 3))(img_input)
 
-    x = ZeroPadding2D((3, 3))(img_input)
+  x = Convolution2D(64, 7, 7, subsample=(2, 2), name='conv1', trainable=trainable)(x)
+  x = FixedBatchNormalization(axis=bn_axis, name='bn_conv1')(x)
+  x = Activation('relu')(x)
+  x = MaxPooling2D((3, 3), strides=(2, 2))(x)
 
-    x = Convolution2D(64, (7, 7), strides=(2, 2), name='conv1', trainable = trainable)(x)
-    x = FixedBatchNormalization(axis=bn_axis, name='bn_conv1')(x)
-    x = Activation('relu')(x)
-    x = MaxPooling2D((3, 3), strides=(2, 2))(x)
+  x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', subsample=(1, 1), trainable=trainable)
+  x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', trainable=trainable)
+  x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', trainable=trainable)
 
-    x = conv_block(x, 3, [64, 64, 256], stage=2, block='a', strides=(1, 1), trainable = trainable)
-    x = identity_block(x, 3, [64, 64, 256], stage=2, block='b', trainable = trainable)
-    x = identity_block(x, 3, [64, 64, 256], stage=2, block='c', trainable = trainable)
+  x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', trainable=trainable)
+  x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', trainable=trainable)
+  x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', trainable=trainable)
+  x = identity_block(x, 3, [128, 128, 512], stage=3, block='d', trainable=trainable)
 
-    x = conv_block(x, 3, [128, 128, 512], stage=3, block='a', trainable = trainable)
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='b', trainable = trainable)
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='c', trainable = trainable)
-    x = identity_block(x, 3, [128, 128, 512], stage=3, block='d', trainable = trainable)
+  x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', trainable=trainable)
+  x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b', trainable=trainable)
+  x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c', trainable=trainable)
+  x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d', trainable=trainable)
+  x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e', trainable=trainable)
+  x = identity_block(x, 3, [256, 256, 1024], stage=4, block='f', trainable=trainable)
 
-    x = conv_block(x, 3, [256, 256, 1024], stage=4, block='a', trainable = trainable)
-    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='b', trainable = trainable)
-    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='c', trainable = trainable)
-    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='d', trainable = trainable)
-    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='e', trainable = trainable)
-    x = identity_block(x, 3, [256, 256, 1024], stage=4, block='f', trainable = trainable)
-
-    return x
+  return x
 
 
 def classifier_layers(x, input_shape, trainable=False):
 
-    # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
-    # (hence a smaller stride in the region that follows the ROI pool)
-    if K.backend() == 'tensorflow':
-        x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(2, 2), trainable=trainable)
-    elif K.backend() == 'theano':
-        x = conv_block_td(x, 3, [512, 512, 2048], stage=5, block='a', input_shape=input_shape, strides=(1, 1), trainable=trainable)
+  # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+  # (hence a smaller stride in the region that follows the ROI pool)
+  if K.backend() == 'tensorflow':
+    x = conv_block_td(
+        x,
+        3, [512, 512, 2048],
+        stage=5,
+        block='a',
+        input_shape=input_shape,
+        subsample=(2, 2),
+        trainable=trainable)
+  elif K.backend() == 'theano':
+    x = conv_block_td(
+        x,
+        3, [512, 512, 2048],
+        stage=5,
+        block='a',
+        input_shape=input_shape,
+        subsample=(1, 1),
+        trainable=trainable)
 
-    x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='b', trainable=trainable)
-    x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='c', trainable=trainable)
-    x = TimeDistributed(AveragePooling2D((7, 7)), name='avg_pool')(x)
+  x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='b', trainable=trainable)
+  x = identity_block_td(x, 3, [512, 512, 2048], stage=5, block='c', trainable=trainable)
+  x = TimeDistributedBatchSizeFixed(AveragePooling2D((7, 7)), name='avg_pool')(x)
 
-    return x
+  return x
 
 
-def rpn(base_layers,num_anchors):
+def rpn(base_layers, num_anchors):
 
-    x = Convolution2D(512, (3, 3), padding='same', activation='relu', kernel_initializer='normal', name='rpn_conv1')(base_layers)
+  x = Convolution2D(
+      512, 3, 3, border_mode='same', activation='relu', init='normal',
+      name='rpn_conv1')(base_layers)
 
-    x_class = Convolution2D(num_anchors, (1, 1), activation='sigmoid', kernel_initializer='uniform', name='rpn_out_class')(x)
-    x_regr = Convolution2D(num_anchors * 4, (1, 1), activation='linear', kernel_initializer='zero', name='rpn_out_regress')(x)
+  x_class = Convolution2D(
+      num_anchors, 1, 1, activation='sigmoid', init='uniform',
+      name='rpn_out_class')(x)
+  x_regr = Convolution2D(
+      num_anchors * 4, 1, 1,
+      activation='linear',
+      init='zero',
+      name='rpn_out_regress')(x)
 
-    return [x_class, x_regr, base_layers]
+  return [x_class, x_regr, base_layers]
 
-def classifier(base_layers, input_rois, num_rois, nb_classes = 21, trainable=False):
 
-    # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
+def classifier(base_layers, input_rois, num_rois, nb_classes=21, trainable=False):
 
-    if K.backend() == 'tensorflow':
-        pooling_regions = 14
-        input_shape = (num_rois,14,14,1024)
-    elif K.backend() == 'theano':
-        pooling_regions = 7
-        input_shape = (num_rois,1024,7,7)
+  # compile times on theano tend to be very high, so we use smaller ROI pooling regions to workaround
 
-    out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([base_layers, input_rois])
-    out = classifier_layers(out_roi_pool, input_shape=input_shape, trainable=True)
+  if K.backend() == 'tensorflow':
+    pooling_regions = 14
+    input_shape = (num_rois, 14, 14, 1024)
+  elif K.backend() == 'theano':
+    pooling_regions = 7
+    input_shape = (num_rois, 1024, 7, 7)
 
-    out = TimeDistributed(Flatten())(out)
+  out_roi_pool = RoiPoolingConv(pooling_regions, num_rois)([base_layers, input_rois])
+  out = classifier_layers(out_roi_pool, input_shape=input_shape, trainable=True)
 
-    out_class = TimeDistributed(Dense(nb_classes, activation='softmax', kernel_initializer='zero'), name='dense_class_{}'.format(nb_classes))(out)
-    # note: no regression target for bg class
-    out_regr = TimeDistributed(Dense(4 * (nb_classes-1), activation='linear', kernel_initializer='zero'), name='dense_regress_{}'.format(nb_classes))(out)
-    return [out_class, out_regr]
+  # START ---- Keras backport 2.0.3 -> 1.2.1
+  flatten_size = np.product(out.get_shape().as_list()[-3:])
+  # END ---- Keras backport 2.0.3 -> 1.2.1
+  out = TimeDistributedBatchSizeFixed(Flatten())(out)
+  # START ---- Keras backport 2.0.3 -> 1.2.1
+  out_shape_mod = out.get_shape().as_list()
+  out_shape_mod[-1] = flatten_size
+  out.set_shape(out_shape_mod)
+  # END ---- Keras backport 2.0.3 -> 1.2.1
 
+  out_class = TimeDistributedBatchSizeFixed(
+      Dense(nb_classes, activation='softmax', init='zero'),
+      name='dense_class_{}'.format(nb_classes))(out)
+  # note: no regression target for bg class
+  out_regr = TimeDistributedBatchSizeFixed(
+      Dense(4 * (nb_classes - 1), activation='linear', init='zero'),
+      name='dense_regress_{}'.format(nb_classes))(out)
+  return [out_class, out_regr]
